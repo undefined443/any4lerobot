@@ -1,0 +1,28 @@
+[project]
+name = "any4lerobot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "~=3.13.0"
+dependencies = [
+    "datasets>=4.8.4",
+    "huggingface-hub>=1.12.0",
+    "jsonlines>=4.0.0",
+    "lerobot>=0.5.1",
+    "numpy>=2.2.6",
+    "pyarrow>=24.0.0",
+    "tqdm>=4.67.3",
+    "torch~=2.10.0",
+    "torchvision",
+    "triton"
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+triton = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

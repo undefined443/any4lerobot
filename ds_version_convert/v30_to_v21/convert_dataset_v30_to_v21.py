@@ -20,9 +20,11 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import os
 import shutil
 import subprocess
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -334,6 +336,30 @@ def _extract_video_segment(
         raise RuntimeError(error_msg) from exc
 
 
+def _process_video_file_episodes(
+    new_root: str,
+    src_path: str,
+    records: list[dict[str, Any]],
+    video_key: str,
+) -> None:
+    """Process all episodes from a single video file."""
+    records = sorted(records, key=lambda rec: float(rec[f"videos/{video_key}/from_timestamp"]))
+
+    for record in records:
+        episode_index = int(record["episode_index"])
+        start = float(record[f"videos/{video_key}/from_timestamp"])
+        end = float(record[f"videos/{video_key}/to_timestamp"])
+
+        dest_chunk = episode_index // DEFAULT_CHUNK_SIZE
+        dest_path = Path(new_root) / LEGACY_VIDEO_PATH_TEMPLATE.format(
+            episode_chunk=dest_chunk,
+            video_key=video_key,
+            episode_index=episode_index,
+        )
+
+        _extract_video_segment(Path(src_path), dest_path, start=start, end=end)
+
+
 def convert_videos(root: Path, new_root: Path, episode_records: list[dict[str, Any]], video_keys: list[str]) -> None:
     if len(video_keys) == 0:
         logging.info("No video features detected; skipping video conversion")
@@ -341,13 +367,14 @@ def convert_videos(root: Path, new_root: Path, episode_records: list[dict[str, A
 
     logging.info("Converting concatenated MP4 files back to per-episode videos")
 
+    tasks = []
     for video_key in video_keys:
         grouped = _group_episodes_by_video_file(episode_records, video_key)
         if len(grouped) == 0:
             logging.info("No video metadata found for key '%s'; skipping", video_key)
             continue
 
-        for (chunk_idx, file_idx), records in tqdm.tqdm(grouped.items(), desc=f"convert videos ({video_key})"):
+        for (chunk_idx, file_idx), records in grouped.items():
             src_path = root / DEFAULT_VIDEO_PATH.format(
                 video_key=video_key,
                 chunk_index=chunk_idx,
@@ -356,21 +383,13 @@ def convert_videos(root: Path, new_root: Path, episode_records: list[dict[str, A
             if not src_path.exists():
                 raise FileNotFoundError(f"Expected MP4 file not found: {src_path}")
 
-            records = sorted(records, key=lambda rec: float(rec[f"videos/{video_key}/from_timestamp"]))
+            tasks.append((str(new_root), str(src_path), records, video_key))
 
-            for record in records:
-                episode_index = int(record["episode_index"])
-                start = float(record[f"videos/{video_key}/from_timestamp"])
-                end = float(record[f"videos/{video_key}/to_timestamp"])
-
-                dest_chunk = episode_index // DEFAULT_CHUNK_SIZE
-                dest_path = new_root / LEGACY_VIDEO_PATH_TEMPLATE.format(
-                    episode_chunk=dest_chunk,
-                    video_key=video_key,
-                    episode_index=episode_index,
-                )
-
-                _extract_video_segment(src_path, dest_path, start=start, end=end)
+    max_workers = max(1, os.cpu_count() // 2) if os.cpu_count() else 2
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_process_video_file_episodes, *task) for task in tasks]
+        for future in tqdm.tqdm(futures, desc="convert videos", total=len(futures)):
+            future.result()
 
 
 def convert_episodes_metadata(new_root: Path, episode_records: list[dict[str, Any]]) -> None:
@@ -455,10 +474,12 @@ def convert_dataset(
     episode_records = load_episode_records(root)
     video_keys = [key for key, ft in load_info(root)["features"].items() if ft.get("dtype") == "video"]
 
-    convert_info(root, new_root, episode_records, video_keys)
-    convert_tasks(root, new_root)
-    convert_data(root, new_root, episode_records)
-    convert_videos(root, new_root, episode_records, video_keys)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        executor.submit(convert_info, root, new_root, episode_records, video_keys)
+        executor.submit(convert_tasks, root, new_root)
+        executor.submit(convert_data, root, new_root, episode_records)
+        executor.submit(convert_videos, root, new_root, episode_records, video_keys)
+
     convert_episodes_metadata(new_root, episode_records)
     copy_ancillary_directories(root, new_root)
 
