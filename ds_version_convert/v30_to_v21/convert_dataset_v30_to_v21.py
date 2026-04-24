@@ -34,6 +34,7 @@ import pyarrow.parquet as pq
 import tqdm
 from datasets import Dataset
 from huggingface_hub import snapshot_download
+from lerobot.datasets.io_utils import load_info, load_tasks, write_info
 from lerobot.datasets.utils import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_DATA_PATH,
@@ -42,11 +43,8 @@ from lerobot.datasets.utils import (
     LEGACY_EPISODES_PATH,
     LEGACY_EPISODES_STATS_PATH,
     LEGACY_TASKS_PATH,
-    load_info,
-    load_tasks,
     serialize_dict,
     unflatten_dict,
-    write_info,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.utils.utils import init_logging
@@ -191,7 +189,7 @@ def convert_data(root: Path, new_root: Path, episode_records: list[dict[str, Any
                 episode_index=episode_index,
             )
             dest_path.parent.mkdir(parents=True, exist_ok=True)
-            Dataset.from_pandas(episode_table).to_parquet(dest_path)
+            pq.write_table(table.slice(start, length), dest_path)
 
 
 def _group_episodes_by_video_file(
@@ -450,6 +448,7 @@ def copy_ancillary_directories(root: Path, new_root: Path) -> None:
 def convert_dataset(
     repo_id: str,
     root: str | Path | None = None,
+    output: str | Path | None = None,
 ) -> None:
     root = HF_LEROBOT_HOME / repo_id if root is None else Path(root)
 
@@ -461,14 +460,13 @@ def convert_dataset(
             local_dir=root,
         )
 
-    old_root = root.parent / f"{root.name}_{V30}"
-    new_root = root.parent / f"{root.name}_{V21}"
+    if output is not None:
+        new_root = Path(output)
+    else:
+        new_root = root.parent / f"{root.name}_{V21}"
 
-    if old_root.is_dir():
-        shutil.rmtree(old_root)
     if new_root.is_dir():
         shutil.rmtree(new_root)
-
     new_root.mkdir(parents=True, exist_ok=True)
 
     episode_records = load_episode_records(root)
@@ -483,8 +481,12 @@ def convert_dataset(
     convert_episodes_metadata(new_root, episode_records)
     copy_ancillary_directories(root, new_root)
 
-    shutil.move(str(root), str(old_root))
-    shutil.move(str(new_root), str(root))
+    if output is None:
+        old_root = root.parent / f"{root.name}_{V30}"
+        if old_root.is_dir():
+            shutil.rmtree(old_root)
+        shutil.move(str(root), str(old_root))
+        shutil.move(str(new_root), str(root))
 
 
 def parse_args() -> argparse.Namespace:
@@ -500,6 +502,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Path to the local dataset root directory. If not provided, the script will use the dataset from local.",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Path to write the converted dataset. If not provided, converts in-place.",
     )
     return parser.parse_args()
 

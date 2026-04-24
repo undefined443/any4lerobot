@@ -1,9 +1,48 @@
 import argparse
+import json
+from pathlib import Path
 
-from huggingface_hub import HfApi
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.utils import EPISODES_STATS_PATH, STATS_PATH, write_info, write_stats
-from lerobot.datasets.v21.convert_dataset_v20_to_v21 import V20, V21
+import jsonlines
+import numpy as np
+
+from lerobot.datasets.io_utils import write_info, write_stats
+from lerobot.datasets.utils import LEGACY_EPISODES_STATS_PATH, STATS_PATH
+from lerobot.utils.constants import HF_LEROBOT_HOME
+
+V20 = "v2.0"
+INFO_PATH = "meta/info.json"
+
+
+def _aggregate_stats(episodes_stats: list[dict]) -> dict[str, dict[str, np.ndarray]]:
+    all_stats = [ep["stats"] for ep in episodes_stats]
+    result = {}
+    for key in all_stats[0]:
+        ep_key_stats = [s[key] for s in all_stats]
+        counts = np.array([s["count"][0] for s in ep_key_stats], dtype=float)
+        total_count = counts.sum()
+
+        mins = np.array([s["min"] for s in ep_key_stats])
+        maxs = np.array([s["max"] for s in ep_key_stats])
+        means = np.array([s["mean"] for s in ep_key_stats])
+        stds = np.array([s["std"] for s in ep_key_stats])
+
+        global_min = mins.min(axis=0)
+        global_max = maxs.max(axis=0)
+
+        w = (counts / total_count).reshape([-1] + [1] * (means.ndim - 1))
+        global_mean = (means * w).sum(axis=0)
+
+        diff = means - global_mean
+        n = counts.reshape([-1] + [1] * (stds.ndim - 1))
+        global_std = np.sqrt((n * (stds**2 + diff**2)).sum(axis=0) / total_count)
+
+        result[key] = {
+            "min": global_min,
+            "max": global_max,
+            "mean": global_mean,
+            "std": global_std,
+        }
+    return result
 
 
 def convert_dataset(
@@ -13,35 +52,23 @@ def convert_dataset(
     delete_old_stats: bool = False,
     branch: str | None = None,
 ):
-    if root is not None:
-        dataset = LeRobotDataset(repo_id, root, revision=V21)
-    else:
-        dataset = LeRobotDataset(repo_id, revision=V21, force_cache_sync=True)
+    root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
 
-    if (dataset.root / STATS_PATH).is_file():
-        (dataset.root / STATS_PATH).unlink()
+    episodes_stats_path = root / LEGACY_EPISODES_STATS_PATH
+    with jsonlines.open(episodes_stats_path) as reader:
+        episodes_stats = list(reader)
 
-    write_stats(dataset.meta.stats, dataset.root)
+    stats = _aggregate_stats(episodes_stats)
 
-    dataset.meta.info["codebase_version"] = V20
-    write_info(dataset.meta.info, dataset.root)
+    if (root / STATS_PATH).is_file():
+        (root / STATS_PATH).unlink()
+    write_stats(stats, root)
 
-    if push_to_hub:
-        dataset.push_to_hub(branch=branch, tag_version=False, allow_patterns="meta/")
-
-    # delete old stats.json file
-    if delete_old_stats and (dataset.root / EPISODES_STATS_PATH).is_file:
-        (dataset.root / EPISODES_STATS_PATH).unlink()
-
-    hub_api = HfApi()
-    if delete_old_stats and hub_api.file_exists(
-        repo_id=dataset.repo_id, filename=EPISODES_STATS_PATH, revision=branch, repo_type="dataset"
-    ):
-        hub_api.delete_file(
-            path_in_repo=EPISODES_STATS_PATH, repo_id=dataset.repo_id, revision=branch, repo_type="dataset"
-        )
-    if push_to_hub:
-        hub_api.create_tag(repo_id, tag=V20, revision=branch, repo_type="dataset")
+    info_path = root / INFO_PATH
+    with open(info_path) as f:
+        info = json.load(f)
+    info["codebase_version"] = V20
+    write_info(info, root)
 
 
 if __name__ == "__main__":
@@ -50,31 +77,16 @@ if __name__ == "__main__":
         "--repo-id",
         type=str,
         required=True,
-        help="Repository identifier on Hugging Face: a community or a user name `/` the name of the dataset "
-        "(e.g. `lerobot/pusht`, `cadene/aloha_sim_insertion_human`).",
     )
     parser.add_argument(
         "--root",
         type=str,
         default=None,
-        help="Path to the local dataset root directory. If not provided, the script will use the dataset from local.",
+        help="Path to the local dataset root directory.",
     )
-    parser.add_argument(
-        "--push-to-hub",
-        action="store_true",
-        help="Push the dataset to the hub after conversion. Defaults to False.",
-    )
-    parser.add_argument(
-        "--delete-old-stats",
-        action="store_true",
-        help="Delete the old stats.json file after conversion. Defaults to False.",
-    )
-    parser.add_argument(
-        "--branch",
-        type=str,
-        default=None,
-        help="Repo branch to push your dataset. Defaults to the main branch.",
-    )
+    parser.add_argument("--push-to-hub", action="store_true")
+    parser.add_argument("--delete-old-stats", action="store_true")
+    parser.add_argument("--branch", type=str, default=None)
 
     args = parser.parse_args()
     convert_dataset(**vars(args))
