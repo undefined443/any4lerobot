@@ -30,7 +30,7 @@ _convert_one() {
 running=0
 while IFS= read -r SRC; do
     name="$(basename "$SRC")"
-    _convert_one "$SRC" "$DST_BASE/$name" "$(basename "$SRC_BASE")/$name" &
+    _convert_one "$SRC" "$DST_BASE/$name" "$(basename "$SRC_BASE")/$name" < /dev/null &
     running=$(( running + 1 ))
     if (( running >= JOBS )); then
         wait -n
