@@ -473,10 +473,14 @@ def convert_dataset(
     video_keys = [key for key, ft in load_info(root)["features"].items() if ft.get("dtype") == "video"]
 
     with ThreadPoolExecutor(max_workers=4) as executor:
-        executor.submit(convert_info, root, new_root, episode_records, video_keys)
-        executor.submit(convert_tasks, root, new_root)
-        executor.submit(convert_data, root, new_root, episode_records)
-        executor.submit(convert_videos, root, new_root, episode_records, video_keys)
+        futures = [
+            executor.submit(convert_info, root, new_root, episode_records, video_keys),
+            executor.submit(convert_tasks, root, new_root),
+            executor.submit(convert_data, root, new_root, episode_records),
+            executor.submit(convert_videos, root, new_root, episode_records, video_keys),
+        ]
+    for future in futures:
+        future.result()
 
     convert_episodes_metadata(new_root, episode_records)
     copy_ancillary_directories(root, new_root)
