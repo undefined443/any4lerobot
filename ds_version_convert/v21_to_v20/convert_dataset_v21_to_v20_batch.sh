@@ -38,22 +38,29 @@ _convert_one() {
         return 0
     fi
 
-    local TMPDIR
+    local TMPDIR EXTRACTED_DIR
     TMPDIR="$(mktemp -d -p "$DST_BASE")"
 
     mkdir -p "$(dirname "$DST_DIR")"
     tar -xzf "$TARBALL" -C "$TMPDIR"
+    EXTRACTED_DIR="$(find "$TMPDIR" -mindepth 1 -name "meta" -type d | head -1 | xargs dirname)"
+
+    if [[ -z "$EXTRACTED_DIR" ]]; then
+        echo "[ERROR] $REL_PATH: could not find meta/ directory after extraction" >&2
+        rm -rf "$TMPDIR"
+        return 1
+    fi
 
     if ! uv run "$CONVERT_SCRIPT" \
             --repo-id="$BASENAME" \
-            --root="$TMPDIR/$BASENAME"; then
+            --root="$EXTRACTED_DIR"; then
         echo "[ERROR] $REL_PATH" >&2
         rm -rf "$TMPDIR"
         return 1
     fi
 
     rm -rf "$DST_DIR"
-    mv "$TMPDIR/$BASENAME" "$DST_DIR"
+    mv "$EXTRACTED_DIR" "$DST_DIR"
     rm -rf "$TMPDIR"
 
     echo "[DONE] $REL_PATH -> $DST_DIR"
@@ -66,7 +73,7 @@ while IFS= read -r TARBALL; do
     _convert_one "$TARBALL" "$SRC_BASE" "$DST_BASE" "$CONVERT_SCRIPT" </dev/null &
     running=$(( running + 1 ))
     if (( running >= JOBS )); then
-        wait -n
+        wait -n || true
         running=$(( running - 1 ))
     fi
 done < <(find "$SRC_BASE" -name "*.tar.gz" | sort)
