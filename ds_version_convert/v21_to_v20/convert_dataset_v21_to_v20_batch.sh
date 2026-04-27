@@ -23,6 +23,8 @@ CONVERT_SCRIPT="$SCRIPT_DIR/convert_dataset_v21_to_v20.py"
 
 trap 'kill 0' INT TERM
 
+mkdir -p "$DST_BASE"
+
 _convert_one() {
     local TARBALL="$1" SRC_BASE="$2" DST_BASE="$3" CONVERT_SCRIPT="$4"
     local REL_PATH BASENAME DST_DIR
@@ -37,11 +39,10 @@ _convert_one() {
     fi
 
     local TMPDIR
-    TMPDIR="$(mktemp -d)"
-
-    tar -xzf "$TARBALL" -C "$TMPDIR"
+    TMPDIR="$(mktemp -d -p "$DST_BASE")"
 
     mkdir -p "$(dirname "$DST_DIR")"
+    tar -xzf "$TARBALL" -C "$TMPDIR"
 
     if ! uv run "$CONVERT_SCRIPT" \
             --repo-id="$BASENAME" \
