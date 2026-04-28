@@ -32,38 +32,85 @@ _convert_one() {
     BASENAME="$(basename "$REL_PATH" .tar.gz)"   # e.g. foo
     DST_DIR="$DST_BASE/${REL_PATH%.tar.gz}"      # e.g. $DST_BASE/articulation_tasks/franka/foo
 
-    if [[ -f "$DST_DIR/meta/info.json" ]] && \
-       grep -q '"codebase_version": "v2.0"' "$DST_DIR/meta/info.json"; then
-        echo "[SKIP] $REL_PATH (already v2.0)"
-        return 0
+    # Detect structure: single dataset vs multi-sub-dataset (meta/info.json at depth 2 vs 3+)
+    local FIRST_META META_DEPTH IS_MULTI=0
+    FIRST_META="$(tar -tzf "$TARBALL" 2>/dev/null | grep '/meta/info\.json$' | head -1)"
+    META_DEPTH="$(echo "$FIRST_META" | tr -cd '/' | wc -c)"
+    [[ "$META_DEPTH" -gt 2 ]] && IS_MULTI=1
+
+    if [[ "$IS_MULTI" -eq 0 ]]; then
+        if [[ -f "$DST_DIR/meta/info.json" ]] && \
+           grep -q '"codebase_version": "v2.0"' "$DST_DIR/meta/info.json"; then
+            echo "[SKIP] $REL_PATH (already v2.0)"
+            return 0
+        fi
+    else
+        # Multi-sub-dataset: skip if every sub-dataset is already v2.0
+        local all_done=1
+        while IFS= read -r subname; do
+            [[ -z "$subname" ]] && continue
+            grep -q '"codebase_version": "v2.0"' "$DST_DIR/$subname/meta/info.json" 2>/dev/null || { all_done=0; break; }
+        done < <(tar -tzf "$TARBALL" 2>/dev/null | awk -F'/' 'NF>=3{print $2}' | sort -u)
+        if [[ "$all_done" -eq 1 ]]; then
+            echo "[SKIP] $REL_PATH (all sub-datasets already v2.0)"
+            return 0
+        fi
     fi
 
-    local TMPDIR EXTRACTED_DIR
+    local TMPDIR
     TMPDIR="$(mktemp -d -p "$DST_BASE")"
-
     mkdir -p "$(dirname "$DST_DIR")"
     tar -xzf "$TARBALL" -C "$TMPDIR"
-    EXTRACTED_DIR="$(find "$TMPDIR" -mindepth 1 -name "meta" -type d | head -1 | xargs dirname)"
 
-    if [[ -z "$EXTRACTED_DIR" ]]; then
-        echo "[ERROR] $REL_PATH: could not find meta/ directory after extraction" >&2
+    if [[ "$IS_MULTI" -eq 0 ]]; then
+        local EXTRACTED_DIR
+        EXTRACTED_DIR="$(find "$TMPDIR" -mindepth 1 -name "meta" -type d | head -1 | xargs dirname)"
+
+        if [[ -z "$EXTRACTED_DIR" ]]; then
+            echo "[ERROR] $REL_PATH: could not find meta/ directory after extraction" >&2
+            rm -rf "$TMPDIR"
+            return 1
+        fi
+
+        if ! uv run "$CONVERT_SCRIPT" --repo-id="$BASENAME" --root="$EXTRACTED_DIR"; then
+            echo "[ERROR] $REL_PATH" >&2
+            rm -rf "$TMPDIR"
+            return 1
+        fi
+
+        rm -rf "$DST_DIR"
+        mv "$EXTRACTED_DIR" "$DST_DIR"
         rm -rf "$TMPDIR"
-        return 1
-    fi
+        echo "[DONE] $REL_PATH -> $DST_DIR"
+    else
+        # Multi-sub-dataset: convert each immediate subdirectory independently
+        local sub_errors=0
+        mkdir -p "$DST_DIR"
+        while IFS= read -r SUBDIR; do
+            local SUBNAME DST_SUBDIR
+            SUBNAME="$(basename "$SUBDIR")"
+            DST_SUBDIR="$DST_DIR/$SUBNAME"
 
-    if ! uv run "$CONVERT_SCRIPT" \
-            --repo-id="$BASENAME" \
-            --root="$EXTRACTED_DIR"; then
-        echo "[ERROR] $REL_PATH" >&2
+            if [[ -f "$DST_SUBDIR/meta/info.json" ]] && \
+               grep -q '"codebase_version": "v2.0"' "$DST_SUBDIR/meta/info.json"; then
+                echo "[SKIP] $REL_PATH/$SUBNAME (already v2.0)"
+                continue
+            fi
+
+            if ! uv run "$CONVERT_SCRIPT" --repo-id="$SUBNAME" --root="$SUBDIR"; then
+                echo "[ERROR] $REL_PATH/$SUBNAME" >&2
+                sub_errors=$(( sub_errors + 1 ))
+                continue
+            fi
+
+            rm -rf "$DST_SUBDIR"
+            mv "$SUBDIR" "$DST_SUBDIR"
+            echo "[DONE] $REL_PATH/$SUBNAME -> $DST_SUBDIR"
+        done < <(find "$TMPDIR/$BASENAME" -mindepth 1 -maxdepth 1 -type d | sort)
+
         rm -rf "$TMPDIR"
-        return 1
+        [[ "$sub_errors" -gt 0 ]] && return 1
     fi
-
-    rm -rf "$DST_DIR"
-    mv "$EXTRACTED_DIR" "$DST_DIR"
-    rm -rf "$TMPDIR"
-
-    echo "[DONE] $REL_PATH -> $DST_DIR"
 }
 
 export -f _convert_one
