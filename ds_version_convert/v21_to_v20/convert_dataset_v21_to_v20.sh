@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: convert_dataset_v21_to_v20_batch.sh <src_base> <dst_base> [jobs]
+# Usage: convert_dataset_v21_to_v20.sh <src_base> <dst_base> [jobs]
 #
 # Batch-convert LeRobot v2.1 datasets (*.tar.gz) to v2.0, extracting them
 # into <dst_base> while mirroring the subdirectory structure of <src_base>.
@@ -11,7 +11,7 @@
 #   jobs       Parallel worker count (default: 4)
 #
 # Example:
-#   bash convert_dataset_v21_to_v20_batch.sh \
+#   bash convert_dataset_v21_to_v20.sh \
 #     /data/sim_updated /output/sim_updated 8
 set -euo pipefail
 
@@ -32,39 +32,46 @@ _convert_one() {
     BASENAME="$(basename "$REL_PATH" .tar.gz)"   # e.g. foo
     DST_DIR="$DST_BASE/${REL_PATH%.tar.gz}"      # e.g. $DST_BASE/articulation_tasks/franka/foo
 
-    # Detect structure: single dataset vs multi-sub-dataset (meta/info.json at depth 2 vs 3+)
-    local FIRST_META META_DEPTH IS_MULTI=0
-    FIRST_META="$(tar -tzf "$TARBALL" 2>/dev/null | grep '/meta/info\.json$' | head -1)"
-    META_DEPTH="$(echo "$FIRST_META" | tr -cd '/' | wc -c)"
-    [[ "$META_DEPTH" -gt 2 ]] && IS_MULTI=1
+    # Fast skip: single dataset already v2.0 (no tar access needed)
+    if [[ -f "$DST_DIR/meta/info.json" ]] && \
+       grep -q '"codebase_version": "v2.0"' "$DST_DIR/meta/info.json"; then
+        echo "[SKIP] $REL_PATH (already v2.0)"
+        return 0
+    fi
 
-    if [[ "$IS_MULTI" -eq 0 ]]; then
-        if [[ -f "$DST_DIR/meta/info.json" ]] && \
-           grep -q '"codebase_version": "v2.0"' "$DST_DIR/meta/info.json"; then
-            echo "[SKIP] $REL_PATH (already v2.0)"
-            return 0
-        fi
-    else
-        # Multi-sub-dataset: skip if every sub-dataset is already v2.0
-        local all_done=1
-        while IFS= read -r subname; do
-            [[ -z "$subname" ]] && continue
-            grep -q '"codebase_version": "v2.0"' "$DST_DIR/$subname/meta/info.json" 2>/dev/null || { all_done=0; break; }
-        done < <(tar -tzf "$TARBALL" 2>/dev/null | awk -F'/' 'NF>=3{print $2}' | sort -u)
-        if [[ "$all_done" -eq 1 ]]; then
+    # Fast skip: multi-sub-dataset where every sub-dataset is already v2.0
+    if [[ -d "$DST_DIR" ]] && [[ ! -d "$DST_DIR/data" ]]; then
+        local found=0 all_done=1
+        while IFS= read -r subdir; do
+            found=1
+            grep -q '"codebase_version": "v2.0"' "$subdir/meta/info.json" 2>/dev/null || { all_done=0; break; }
+        done < <(find "$DST_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+        if [[ "$found" -eq 1 && "$all_done" -eq 1 ]]; then
             echo "[SKIP] $REL_PATH (all sub-datasets already v2.0)"
             return 0
         fi
     fi
 
+    # Extract first, then detect structure from content (avoids slow tar -tzf on large archives)
     local TMPDIR
     TMPDIR="$(mktemp -d -p "$DST_BASE")"
     mkdir -p "$(dirname "$DST_DIR")"
-    tar -xzf "$TARBALL" -C "$TMPDIR"
+    if ! tar -xzf "$TARBALL" -C "$TMPDIR"; then
+        echo "[ERROR] $REL_PATH: extraction failed" >&2
+        rm -rf "$TMPDIR"
+        return 1
+    fi
+
+    # Collect all directories that contain a meta/ subdir; >1 means multi-sub-dataset
+    local META_PARENTS IS_MULTI=0
+    META_PARENTS="$(find "$TMPDIR" -name "meta" -type d | xargs -I{} dirname {} | sort -u)"
+    local META_COUNT
+    META_COUNT="$(echo "$META_PARENTS" | grep -c .)" || true
+    [[ "$META_COUNT" -gt 1 ]] && IS_MULTI=1
 
     if [[ "$IS_MULTI" -eq 0 ]]; then
         local EXTRACTED_DIR
-        EXTRACTED_DIR="$(find "$TMPDIR" -mindepth 1 -name "meta" -type d | head -1 | xargs dirname)"
+        EXTRACTED_DIR="$(echo "$META_PARENTS" | head -1)"
 
         if [[ -z "$EXTRACTED_DIR" ]]; then
             echo "[ERROR] $REL_PATH: could not find meta/ directory after extraction" >&2
@@ -83,7 +90,11 @@ _convert_one() {
         rm -rf "$TMPDIR"
         echo "[DONE] $REL_PATH -> $DST_DIR"
     else
-        # Multi-sub-dataset: convert each immediate subdirectory independently
+        # Multi-sub-dataset: container dir is the common parent of all sub-dataset dirs
+        local CONTAINER_DIR
+        CONTAINER_DIR="$(echo "$META_PARENTS" | xargs -I{} dirname {} | sort -u | head -1)"
+
+        # Convert each immediate subdirectory independently
         local sub_errors=0
         mkdir -p "$DST_DIR"
         while IFS= read -r SUBDIR; do
@@ -106,7 +117,7 @@ _convert_one() {
             rm -rf "$DST_SUBDIR"
             mv "$SUBDIR" "$DST_SUBDIR"
             echo "[DONE] $REL_PATH/$SUBNAME -> $DST_SUBDIR"
-        done < <(find "$TMPDIR/$BASENAME" -mindepth 1 -maxdepth 1 -type d | sort)
+        done < <(find "$CONTAINER_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
 
         rm -rf "$TMPDIR"
         [[ "$sub_errors" -gt 0 ]] && return 1
@@ -124,6 +135,6 @@ while IFS= read -r TARBALL; do
         running=$(( running - 1 ))
     fi
 done < <(find "$SRC_BASE" -name "*.tar.gz" | sort)
-wait
+wait || true
 
 echo "All done."
